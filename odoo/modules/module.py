@@ -2,7 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 import ast
-import functools
+import collections
 import imp
 import importlib
 import inspect
@@ -23,134 +23,35 @@ import odoo
 import odoo.tools as tools
 import odoo.release as release
 from odoo import SUPERUSER_ID, api
+from odoo.tools import pycompat
 
 MANIFEST_NAMES = ('__manifest__.py', '__openerp__.py')
 README = ['README.rst', 'README.md', 'README.txt']
 
 _logger = logging.getLogger(__name__)
 
-# addons path as a list
-ad_paths = []
-hooked = False
-
 # Modules already loaded
 loaded = []
 
-class AddonsHook(object):
-    """ Makes modules accessible through openerp.addons.* and odoo.addons.* """
-
-    def find_module(self, name, path=None):
-        if name.startswith(('odoo.addons.', 'openerp.addons.'))\
-                and name.count('.') == 2:
-            return self
-
-    def load_module(self, name):
-        assert name not in sys.modules
-
-        # get canonical names
-        odoo_name = re.sub(r'^openerp.addons.(\w+)$', r'odoo.addons.\g<1>', name)
-        openerp_name = re.sub(r'^odoo.addons.(\w+)$', r'openerp.addons.\g<1>', odoo_name)
-
-        assert odoo_name not in sys.modules
-        assert openerp_name not in sys.modules
-
-        # get module name in addons paths
-        _1, _2, addon_name = name.split('.')
-        # load module
-        f, path, (_suffix, _mode, type_) = imp.find_module(addon_name, ad_paths)
-        if f: f.close()
-
-        # TODO: fetch existing module from sys.modules if reloads permitted
-        # create empty odoo.addons.* module, set name
-        new_mod = types.ModuleType(odoo_name)
-        new_mod.__loader__ = self
-
-        # module top-level can only be a package
-        assert type_ == imp.PKG_DIRECTORY, "Odoo addon top-level must be a package"
-        modfile = opj(path, '__init__.py')
-        new_mod.__file__ = modfile
-        new_mod.__path__ = [path]
-        new_mod.__package__ = odoo_name
-
-        # both base and alias should be in sys.modules to handle recursive and
-        # corecursive situations
-        sys.modules[odoo_name] = sys.modules[openerp_name] = new_mod
-
-        # execute source in context of module *after* putting everything in
-        # sys.modules, so recursive import works
-        execfile(modfile, new_mod.__dict__)
-
-        # people import openerp.addons and expect openerp.addons.<module> to work
-        setattr(odoo.addons, addon_name, new_mod)
-
-        return sys.modules[name]
-# need to register loader with setuptools as Jinja relies on it when using
-# PackageLoader
-pkg_resources.register_loader_type(AddonsHook, pkg_resources.DefaultProvider)
-
-class OdooHook(object):
-    """ Makes odoo package also available as openerp """
-
-    def find_module(self, name, path=None):
-        # openerp.addons.<identifier> should already be matched by AddonsHook,
-        # only framework and subdirectories of modules should match
-        if re.match(r'^openerp\b', name):
-            return self
-
-    def load_module(self, name):
-        assert name not in sys.modules
-
-        canonical = re.sub(r'^openerp(.*)', r'odoo\g<1>', name)
-
-        if canonical in sys.modules:
-            mod = sys.modules[canonical]
-        else:
-            # probable failure: canonical execution calling old naming -> corecursion
-            mod = importlib.import_module(canonical)
-
-        # just set the original module at the new location. Don't proxy,
-        # it breaks *-import (unless you can find how `from a import *` lists
-        # what's supposed to be imported by `*`, and manage to override it)
-        sys.modules[name] = mod
-
-        return sys.modules[name]
-
 def initialize_sys_path():
     """
-    Setup an import-hook to be able to import OpenERP addons from the different
-    addons paths.
-
-    This ensures something like ``import crm`` (or even
-    ``import odoo.addons.crm``) works even if the addons are not in the
-    PYTHONPATH.
+    Setup the addons path ``odoo.addons.__path__`` with various defaults
+    and explicit directories.
     """
-    global ad_paths
-    global hooked
 
-    dd = tools.config.addons_data_dir
-    if dd not in ad_paths:
-        ad_paths.append(dd)
+    dd = os.path.normcase(tools.config.addons_data_dir)
+    if os.access(dd, os.R_OK) and dd not in odoo.addons.__path__:
+        odoo.addons.__path__.append(dd)
 
     for ad in tools.config['addons_path'].split(','):
-        ad = os.path.abspath(tools.ustr(ad.strip()))
-        if ad not in ad_paths:
-            ad_paths.append(ad)
+        ad = os.path.normcase(os.path.abspath(tools.ustr(ad.strip())))
+        if ad not in odoo.addons.__path__:
+            odoo.addons.__path__.append(ad)
 
     # add base module path
-    base_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'addons'))
-    if base_path not in ad_paths:
-        ad_paths.append(base_path)
-
-    # add odoo.addons.__path__
-    for ad in __import__('odoo.addons').addons.__path__:
-        ad = os.path.abspath(ad)
-        if ad not in ad_paths:
-            ad_paths.append(ad)
-
-    if not hooked:
-        sys.meta_path.append(AddonsHook())
-        sys.meta_path.append(OdooHook())
-        hooked = True
+    base_path = os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'addons')))
+    if base_path not in odoo.addons.__path__ and os.path.isdir(base_path):
+        odoo.addons.__path__.append(base_path)
 
 def get_module_path(module, downloaded=False, display_warning=True):
     """Return the path of the given module.
@@ -161,7 +62,7 @@ def get_module_path(module, downloaded=False, display_warning=True):
 
     """
     initialize_sys_path()
-    for adp in ad_paths:
+    for adp in odoo.addons.__path__:
         files = [opj(adp, module, manifest) for manifest in MANIFEST_NAMES] +\
                 [opj(adp, module + '.zip')]
         if any(os.path.exists(f) for f in files):
@@ -240,7 +141,7 @@ def get_resource_from_path(path):
     :return: tuple(module_name, relative_path, os_relative_path) if possible, else None
     """
     resource = False
-    for adpath in ad_paths:
+    for adpath in odoo.addons.__path__:
         # force trailing separator
         adpath = os.path.join(adpath, "")
         if os.path.commonprefix([adpath, path]) == adpath:
@@ -271,7 +172,7 @@ def module_manifest(path):
 
 def get_module_root(path):
     """
-    Get closest module's root begining from path
+    Get closest module's root beginning from path
 
         # Given:
         # /foo/bar/module_dir/static/src/...
@@ -302,7 +203,7 @@ def load_information_from_description_file(module, mod_path=None):
     :param mod_path: Physical path of module, if not providedThe name of the module (sale, purchase, ...)
     """
     if not mod_path:
-        mod_path = get_module_path(module)
+        mod_path = get_module_path(module, downloaded=True)
     manifest_file = module_manifest(mod_path)
     if manifest_file:
         # default values for descriptor
@@ -319,17 +220,17 @@ def load_information_from_description_file(module, mod_path=None):
             'post_load': None,
             'version': '1.0',
             'web': False,
-            'website': 'https://www.odoo.com',
             'sequence': 100,
             'summary': '',
+            'website': '',
         }
-        info.update(itertools.izip(
+        info.update(zip(
             'depends data demo test init_xml update_xml demo_xml'.split(),
             iter(list, None)))
 
-        f = tools.file_open(manifest_file)
+        f = tools.file_open(manifest_file, mode='rb')
         try:
-            info.update(ast.literal_eval(f.read()))
+            info.update(ast.literal_eval(pycompat.to_text(f.read())))
         finally:
             f.close()
 
@@ -337,12 +238,26 @@ def load_information_from_description_file(module, mod_path=None):
             readme_path = [opj(mod_path, x) for x in README
                            if os.path.isfile(opj(mod_path, x))]
             if readme_path:
-                readme_text = tools.file_open(readme_path[0]).read()
-                info['description'] = readme_text
+                with tools.file_open(readme_path[0]) as fd:
+                    info['description'] = fd.read()
 
-        if 'active' in info:
-            # 'active' has been renamed 'auto_install'
-            info['auto_install'] = info['active']
+        # auto_install is set to `False` if disabled, and a set of
+        # auto_install dependencies otherwise. That way, we can set
+        # auto_install: [] to always auto_install a module regardless of its
+        # dependencies
+        auto_install = info.get('auto_install', info.get('active', False))
+        if isinstance(auto_install, collections.Iterable):
+            info['auto_install'] = set(auto_install)
+            non_dependencies = info['auto_install'].difference(info['depends'])
+            assert not non_dependencies,\
+                "auto_install triggers must be dependencies, found " \
+                "non-dependencies [%s] for module %s" % (
+                    ', '.join(non_dependencies), module
+                )
+        elif auto_install:
+            info['auto_install'] = set(info['depends'])
+        else:
+            info['auto_install'] = False
 
         info['version'] = adapt_version(info['version'])
         return info
@@ -373,7 +288,7 @@ def load_openerp_module(module_name):
         if info['post_load']:
             getattr(sys.modules['odoo.addons.' + module_name], info['post_load'])()
 
-    except Exception, e:
+    except Exception as e:
         msg = "Couldn't load module %s" % (module_name)
         _logger.critical(msg)
         _logger.critical(e)
@@ -395,11 +310,15 @@ def get_modules():
             for mname in MANIFEST_NAMES:
                 if os.path.isfile(opj(dir, name, mname)):
                     return True
-        return map(clean, filter(is_really_module, os.listdir(dir)))
+        return [
+            clean(it)
+            for it in os.listdir(dir)
+            if is_really_module(it)
+        ]
 
     plist = []
     initialize_sys_path()
-    for ad in ad_paths:
+    for ad in odoo.addons.__path__:
         plist.extend(listdir(ad))
     return list(set(plist))
 
@@ -427,14 +346,17 @@ def get_test_modules(module):
     modpath = 'odoo.addons.' + module
     try:
         mod = importlib.import_module('.tests', modpath)
-    except Exception, e:
-        # If module has no `tests` sub-module, no problem.
-        if str(e) != 'No module named tests':
-            _logger.exception('Can not `import %s`.', module)
+    except ImportError as e:  # will also catch subclass ModuleNotFoundError of P3.6
+        # Hide ImportErrors on `tests` sub-module, but display other exceptions
+        if e.name == modpath + '.tests' and e.msg.startswith('No module named'):
+            return []
+        _logger.exception('Can not `import %s`.', module)
         return []
-
+    except Exception as e:
+        _logger.exception('Can not `import %s`.', module)
+        return []
     if hasattr(mod, 'fast_suite') or hasattr(mod, 'checks'):
-        _logger.warn(
+        _logger.warning(
             "Found deprecated fast_suite or checks attribute in test module "
             "%s. These have no effect in or after version 8.0.",
             mod.__name__)
@@ -443,62 +365,150 @@ def get_test_modules(module):
               if name.startswith('test_')]
     return result
 
-# Use a custom stream object to log the test executions.
-class TestStream(object):
-    def __init__(self, logger_name='odoo.tests'):
-        self.logger = logging.getLogger(logger_name)
-        self.r = re.compile(r'^-*$|^ *... *$|^ok$')
-    def flush(self):
-        pass
-    def write(self, s):
-        if self.r.match(s):
+
+class OdooTestResult(unittest.result.TestResult):
+    """
+    This class in inspired from TextTestResult (https://github.com/python/cpython/blob/master/Lib/unittest/runner.py)
+    Instead of using a stream, we are using the logger,
+    but replacing the "findCaller" in order to give the information we
+    have based on the test object that is running.
+    """
+
+    def log(self, level, msg, *args, test=None, exc_info=None, extra=None, stack_info=False, caller_infos=None):
+        """
+        ``test`` is the running test case, ``caller_infos`` is
+        (fn, lno, func, sinfo) (logger.findCaller format), see logger.log for
+        the other parameters.
+        """
+        test = test or self
+        if isinstance(test, unittest.case._SubTest) and test.test_case:
+            test = test.test_case
+        logger = logging.getLogger(test.__module__)
+        try:
+            caller_infos = caller_infos or logger.findCaller(stack_info)
+        except ValueError:
+            caller_infos = "(unknown file)", 0, "(unknown function)", None
+        (fn, lno, func, sinfo) = caller_infos
+        # using logger.log makes it difficult to spot-replace findCaller in
+        # order to provide useful location information (the problematic spot
+        # inside the test function), so use lower-level functions instead
+        if logger.isEnabledFor(level):
+            record = logger.makeRecord(logger.name, level, fn, lno, msg, args, exc_info, func, extra, sinfo)
+            logger.handle(record)
+
+    def getDescription(self, test):
+        if isinstance(test, unittest.case._SubTest):
+            return 'Subtest %s' % test._subDescription()
+        if isinstance(test, unittest.TestCase):
+            # since we have the module name in the logger, this will avoid to duplicate module info in log line
+            # we only apply this for TestCase since we can receive error handler or other special case
+            return "%s.%s" % (test.__class__.__qualname__, test._testMethodName)
+        return str(test)
+
+    def startTest(self, test):
+        super().startTest(test)
+        self.log(logging.INFO, 'Starting %s ...', self.getDescription(test), test=test)
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self.logError("ERROR", test, err)
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self.logError("FAIL", test, err)
+
+    def addSubTest(self, test, subtest, err):
+        # since addSubTest is not making a call to addFailure or addError we need to manage it too
+        # https://github.com/python/cpython/blob/3.7/Lib/unittest/result.py#L136
+        if err is not None:
+            if issubclass(err[0], test.failureException):
+                flavour = "FAIL"
+            else:
+                flavour = "ERROR"
+            self.logError(flavour, subtest, err)
+        super().addSubTest(test, subtest, err)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self.log(logging.INFO, 'skipped %s', self.getDescription(test), test=test)
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        self.log(logging.ERROR, 'unexpected success for %s', self.getDescription(test), test=test)
+
+    def logError(self, flavour, test, error):
+        err = self._exc_info_to_string(error, test)
+        caller_infos = self.getErrorCallerInfo(error, test)
+        self.log(logging.INFO, '=' * 70, test=test, caller_infos=caller_infos)  # keep this as info !!!!!!
+        self.log(logging.ERROR, "%s: %s\n%s", flavour, self.getDescription(test), err, test=test, caller_infos=caller_infos)
+
+    def getErrorCallerInfo(self, error, test):
+        """
+        :param error: A tuple (exctype, value, tb) as returned by sys.exc_info().
+        :param test: A TestCase that created this error.
+        :returns: a tuple (fn, lno, func, sinfo) matching the logger findCaller format or None
+        """
+
+        # only test case should be executed in odoo, this is only a safe guard
+        if isinstance(test, unittest.suite._ErrorHolder):
             return
-        first = True
-        level = logging.ERROR if s.startswith(('ERROR', 'FAIL', 'Traceback')) else logging.INFO
-        for c in s.splitlines():
-            if not first:
-                c = '` ' + c
-            first = False
-            self.logger.log(level, c)
+        if not isinstance(test, unittest.TestCase):
+            _logger.warning('%r is not a TestCase' % test)
+            return
+        _, _, error_traceback = error
+
+        while error_traceback:
+            code = error_traceback.tb_frame.f_code
+            if code.co_name == test._testMethodName:
+                lineno = error_traceback.tb_lineno
+                filename = code.co_filename
+                method = test._testMethodName
+                infos = (filename, lineno, method, None)
+                return infos
+            error_traceback = error_traceback.tb_next
+
+
+class OdooTestRunner(object):
+    """A test runner class that displays results in in logger.
+    Simplified verison of TextTestRunner(
+    """
+
+    def run(self, test):
+        result = OdooTestResult()
+
+        start_time = time.perf_counter()
+        test(result)
+        time_taken = time.perf_counter() - start_time
+        run = result.testsRun
+        _logger.info("Ran %d test%s in %.3fs", run, run != 1 and "s" or "", time_taken)
+        return result
 
 current_test = None
 
-def runs_at(test, hook, default):
-    # by default, tests do not run post install
-    test_runs = getattr(test, hook, default)
-
-    # for a test suite, we're done
-    if not isinstance(test, unittest.TestCase):
-        return test_runs
-
-    # otherwise check the current test method to see it's been set to a
-    # different state
-    method = getattr(test, test._testMethodName)
-    return getattr(method, hook, test_runs)
-
-runs_at_install = functools.partial(runs_at, hook='at_install', default=True)
-runs_post_install = functools.partial(runs_at, hook='post_install', default=False)
-
-def run_unit_tests(module_name, dbname, position=runs_at_install):
+def run_unit_tests(module_name, position='at_install'):
     """
     :returns: ``True`` if all of ``module_name``'s tests succeeded, ``False``
               if any of them failed.
     :rtype: bool
     """
     global current_test
+    # avoid dependency hell
+    from odoo.tests.common import TagsSelector, OdooSuite
     current_test = module_name
     mods = get_test_modules(module_name)
     threading.currentThread().testing = True
+    config_tags = TagsSelector(tools.config['test_tags'])
+    position_tag = TagsSelector(position)
     r = True
     for m in mods:
         tests = unwrap_suite(unittest.TestLoader().loadTestsFromModule(m))
-        suite = unittest.TestSuite(itertools.ifilter(position, tests))
+        suite = OdooSuite(t for t in tests if position_tag.check(t) and config_tags.check(t))
 
         if suite.countTestCases():
             t0 = time.time()
             t0_sql = odoo.sql_db.sql_counter
             _logger.info('%s running tests.', m.__name__)
-            result = unittest.TextTestRunner(verbosity=2, stream=TestStream(m.__name__)).run(suite)
+            result = OdooTestRunner().run(suite)
             if time.time() - t0 > 5:
                 _logger.log(25, "%s tested in %.2fs, %s queries", m.__name__, time.time() - t0, odoo.sql_db.sql_counter - t0_sql)
             if not result.wasSuccessful():
@@ -532,5 +542,5 @@ def unwrap_suite(test):
         return
 
     for item in itertools.chain.from_iterable(
-            itertools.imap(unwrap_suite, subtests)):
+            unwrap_suite(t) for t in subtests):
         yield item

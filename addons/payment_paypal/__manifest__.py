@@ -2,7 +2,7 @@
 
 {
     'name': 'Paypal Payment Acquirer',
-    'category': 'Accounting',
+    'category': 'Accounting/Payment',
     'summary': 'Payment Acquirer: Paypal Implementation',
     'version': '1.0',
     'description': """Paypal Payment Acquirer""",
@@ -10,8 +10,9 @@
     'data': [
         'views/payment_views.xml',
         'views/payment_paypal_templates.xml',
-        'views/account_config_settings_views.xml',
         'data/payment_acquirer_data.xml',
+        'data/payment_paypal_email_data.xml',
     ],
     'installable': True,
+    'post_init_hook': 'create_missing_journal_for_acquirers',
 }

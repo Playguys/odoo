@@ -6,6 +6,7 @@ import logging
 
 import json
 
+import werkzeug.urls
 import werkzeug.utils
 from werkzeug.exceptions import BadRequest
 
@@ -108,21 +109,10 @@ class OAuthLogin(Home):
 
         return response
 
-    @http.route()
-    def web_auth_signup(self, *args, **kw):
-        providers = self.list_providers()
-        if len(providers) == 1:
-            werkzeug.exceptions.abort(werkzeug.utils.redirect(providers[0]['auth_link'], 303))
-        response = super(OAuthLogin, self).web_auth_signup(*args, **kw)
-        response.qcontext.update(providers=providers)
-        return response
-
-    @http.route()
-    def web_auth_reset_password(self, *args, **kw):
-        providers = self.list_providers()
-        response = super(OAuthLogin, self).web_auth_reset_password(*args, **kw)
-        response.qcontext.update(providers=providers)
-        return response
+    def get_auth_signup_qcontext(self):
+        result = super(OAuthLogin, self).get_auth_signup_qcontext()
+        result["providers"] = self.list_providers()
+        return result
 
 
 class OAuthController(http.Controller):
@@ -132,6 +122,8 @@ class OAuthController(http.Controller):
     def signin(self, **kw):
         state = json.loads(kw['state'])
         dbname = state['d']
+        if not http.db_filter([dbname]):
+            return BadRequest()
         provider = state['p']
         context = state.get('c', {})
         registry = registry_get(dbname)
@@ -150,7 +142,11 @@ class OAuthController(http.Controller):
                     url = '/web#action=%s' % action
                 elif menu:
                     url = '/web#menu_id=%s' % menu
-                return login_and_redirect(*credentials, redirect_url=url)
+                resp = login_and_redirect(*credentials, redirect_url=url)
+                # Since /web is hardcoded, verify user has right to land on it
+                if werkzeug.urls.url_parse(resp.location).path == '/web' and not request.env.user.has_group('base.group_user'):
+                    resp.location = '/'
+                return resp
             except AttributeError:
                 # auth_signup is not installed
                 _logger.error("auth_signup not installed on database %s: oauth sign up cancelled." % (dbname,))
@@ -162,7 +158,7 @@ class OAuthController(http.Controller):
                 redirect = werkzeug.utils.redirect(url, 303)
                 redirect.autocorrect_location_header = False
                 return redirect
-            except Exception, e:
+            except Exception as e:
                 # signup error
                 _logger.exception("OAuth2: %s" % str(e))
                 url = "/web/login?oauth_error=2"
@@ -176,6 +172,8 @@ class OAuthController(http.Controller):
         if not dbname:
             dbname = db_monodb()
         if not dbname:
+            return BadRequest()
+        if not http.db_filter([dbname]):
             return BadRequest()
 
         registry = registry_get(dbname)

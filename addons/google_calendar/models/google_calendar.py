@@ -2,12 +2,14 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from datetime import datetime, timedelta
+
+import requests
 from dateutil import parser
 import json
 import logging
 import operator
 import pytz
-import urllib2
+from werkzeug import urls
 
 from odoo import api, fields, models, tools, _
 from odoo.tools import exception_to_unicode
@@ -23,15 +25,13 @@ class Meta(type):
     """ This Meta class allow to define class as a structure, and so instancied variable
         in __init__ to avoid to have side effect alike 'static' variable """
     def __new__(typ, name, parents, attrs):
-        methods = dict((k, v) for k, v in attrs.iteritems()
-                       if callable(v))
-        attrs = dict((k, v) for k, v in attrs.iteritems()
-                     if not callable(v))
+        methods = {k: v for k, v in attrs.items() if callable(v)}
+        attrs = {k: v for k, v in attrs.items() if not callable(v)}
 
         def init(self, **kw):
-            for key, val in attrs.iteritems():
+            for key, val in attrs.items():
                 setattr(self, key, val)
-            for key, val in kw.iteritems():
+            for key, val in kw.items():
                 assert key in attrs
                 setattr(self, key, val)
 
@@ -40,9 +40,7 @@ class Meta(type):
         return type.__new__(typ, name, parents, methods)
 
 
-class Struct(object):
-    __metaclass__ = Meta
-
+Struct = Meta('Struct', (object,), {})
 
 class OdooEvent(Struct):
     event = False
@@ -83,8 +81,8 @@ class SyncEvent(object):
                 self.OP = Delete((self.OE.status and "OE") or (self.GG.status and "GG"),
                                  'The event has been deleted from one side, we delete on other side !')
             #If event is not deleted !
-            elif self.OE.status and (self.GG.status or not is_owner):
-                if self.OE.update.split('.')[0] != self.GG.update.split('.')[0]:
+            elif self.OE.status and (self.GG.status or (not is_owner and self.GG.update)):
+                if abs(self.OE.update - self.GG.update) > timedelta(seconds=1):
                     if self.OE.update < self.GG.update:
                         tmpSrc = 'GG'
                     elif self.OE.update > self.GG.update:
@@ -102,7 +100,7 @@ class SyncEvent(object):
                     else:
                         self.OP = Update(tmpSrc, 'Simply Update... I\'m a single event')
                 else:
-                    if not self.OE.synchro or self.OE.synchro.split('.')[0] < self.OE.update.split('.')[0]:
+                    if not self.OE.synchro or self.OE.synchro < (self.OE.update + timedelta(seconds=1)):
                         self.OP = Update('OE', 'Event already updated by another user, but not synchro with my google calendar')
                     else:
                         self.OP = NothingToDo("", 'Not update needed')
@@ -191,16 +189,17 @@ class Exclude(SyncOperation):
 class GoogleCalendar(models.AbstractModel):
     STR_SERVICE = 'calendar'
     _name = 'google.%s' % STR_SERVICE
+    _description = 'Google Calendar'
 
     def generate_data(self, event, isCreating=False):
         if event.allday:
-            start_date = fields.Datetime.context_timestamp(self, fields.Datetime.from_string(event.start)).isoformat('T').split('T')[0]
-            final_date = fields.Datetime.context_timestamp(self, fields.Datetime.from_string(event.stop) + timedelta(days=1)).isoformat('T').split('T')[0]
+            start_date = fields.Date.to_string(event.start_date)
+            final_date = fields.Date.to_string(event.stop_date + timedelta(days=1))
             type = 'date'
             vstype = 'dateTime'
         else:
-            start_date = fields.Datetime.context_timestamp(self, fields.Datetime.from_string(event.start)).isoformat('T')
-            final_date = fields.Datetime.context_timestamp(self, fields.Datetime.from_string(event.stop)).isoformat('T')
+            start_date = fields.Datetime.context_timestamp(self, event.start).isoformat('T')
+            final_date = fields.Datetime.context_timestamp(self, event.stop).isoformat('T')
             type = 'dateTime'
             vstype = 'date'
         attendee_list = []
@@ -216,7 +215,7 @@ class GoogleCalendar(models.AbstractModel):
         reminders = []
         for alarm in event.alarm_ids:
             reminders.append({
-                "method": "email" if alarm.type == "email" else "popup",
+                "method": "email" if alarm.alarm_type == "email" else "popup",
                 "minutes": alarm.duration_minutes
             })
         data = {
@@ -249,7 +248,8 @@ class GoogleCalendar(models.AbstractModel):
         if not self.get_need_synchro_attendee():
             data.pop("attendees")
         if isCreating:
-            other_google_ids = [other_att.google_internal_event_id for other_att in event.attendee_ids if other_att.google_internal_event_id]
+            other_google_ids = [other_att.google_internal_event_id for other_att in event.attendee_ids
+                                if other_att.google_internal_event_id and not other_att.google_internal_event_id.startswith('_')]
             if other_google_ids:
                 data["id"] = other_google_ids[0]
         return data
@@ -260,7 +260,7 @@ class GoogleCalendar(models.AbstractModel):
         """
         data = self.generate_data(event, isCreating=True)
 
-        url = "/calendar/v3/calendars/%s/events?fields=%s&access_token=%s" % ('primary', urllib2.quote('id,updated'), self.get_token())
+        url = "/calendar/v3/calendars/%s/events?fields=%s&access_token=%s" % ('primary', urls.url_quote('id,updated'), self.get_token())
         headers = {'Content-type': 'application/json', 'Accept': 'text/plain'}
         data_json = json.dumps(data)
         return self.env['google.service']._do_request(url, data_json, headers, type='POST')
@@ -291,8 +291,8 @@ class GoogleCalendar(models.AbstractModel):
 
         try:
             status, content, ask_time = self.env['google.service']._do_request(url, params, headers, type='GET')
-        except urllib2.HTTPError, e:
-            if e.code == 401:  # Token invalid / Acces unauthorized
+        except requests.HTTPError as e:
+            if e.response.status_code == 401:  # Token invalid / Acces unauthorized
                 error_msg = _("Your token is invalid or has been revoked !")
 
                 self.env.user.write({'google_calendar_token': False, 'google_calendar_token_validity': False})
@@ -356,7 +356,7 @@ class GoogleCalendar(models.AbstractModel):
         url = "/calendar/v3/calendars/%s/events/%s" % ('primary', google_id)
         try:
             status, content, ask_time = self.env['google.service']._do_request(url, params, headers, type='GET')
-        except Exception, e:
+        except Exception as e:
             _logger.info("Calendar Synchro - In except of get_one_event_synchro")
             _logger.info(exception_to_unicode(e))
             return False
@@ -398,9 +398,33 @@ class GoogleCalendar(models.AbstractModel):
         url = "/calendar/v3/calendars/%s/events/%s?access_token=%s" % ('primary', instance_id, self.get_token())
         headers = {'Content-type': 'application/json'}
 
-        data.update(recurringEventId=event_ori_google_id, originalStartTime=event_new.recurrent_id_date, sequence=self.get_sequence(instance_id))
+        _originalStartTime = dict()
+        if event_new.allday:
+            _originalStartTime['date'] = event_new.recurrent_id_date.strftime("%Y-%m-%d")
+        else:
+            _originalStartTime['datetime'] = event_new.recurrent_id_date.strftime("%Y-%m-%dT%H:%M:%S.%fz")
+
+        data.update(
+            recurringEventId=event_ori_google_id,
+            originalStartTime=_originalStartTime,
+            sequence=self.get_sequence(instance_id)
+        )
         data_json = json.dumps(data)
         return self.env['google.service']._do_request(url, data_json, headers, type='PUT')
+
+    def create_from_google(self, event, partner_id):
+        context_tmp = dict(self._context, NewMeeting=True)
+        res = self.with_context(context_tmp).update_from_google(False, event.GG.event, "create")
+        event.OE.event_id = res
+        meeting = self.env['calendar.event'].browse(res)
+        attendee_record = self.env['calendar.attendee'].search([('partner_id', '=', partner_id), ('event_id', '=', res)])
+        attendee_record.with_context(context_tmp).write({'oe_synchro_date': meeting.oe_update_date, 'google_internal_event_id': event.GG.event['id']})
+        if meeting.recurrency:
+            attendees = self.env['calendar.attendee'].sudo().search([('google_internal_event_id', '=ilike', '%s\_%%' % event.GG.event['id'])])
+            excluded_recurrent_event_ids = set(attendee.event_id for attendee in attendees)
+            for event in excluded_recurrent_event_ids:
+                event.write({'recurrent_id': meeting.id, 'recurrent_id_date': event.start, 'user_id': meeting.user_id.id})
+        return event
 
     def update_from_google(self, event, single_event_dict, type):
         """ Update an event in Odoo with information from google calendar
@@ -428,11 +452,12 @@ class GoogleCalendar(models.AbstractModel):
                 if google_attendee.get('found'):
                     continue
 
-                attendee = ResPartner.search([('email', '=', google_attendee['email'])], limit=1)
+                attendee = ResPartner.search([('email', '=ilike', google_attendee['email']), ('user_ids', '!=', False)], limit=1)
+                if not attendee:
+                    attendee = ResPartner.search([('email', '=ilike', google_attendee['email'])], limit=1)
                 if not attendee:
                     data = {
                         'email': partner_email,
-                        'customer': False,
                         'name': google_attendee.get("displayName", False) or partner_email
                     }
                     attendee = ResPartner.create(data)
@@ -444,13 +469,13 @@ class GoogleCalendar(models.AbstractModel):
         for google_alarm in single_event_dict.get('reminders', {}).get('overrides', []):
             alarm = CalendarAlarm.search(
                 [
-                    ('type', '=', google_alarm['method'] if google_alarm['method'] == 'email' else 'notification'),
+                    ('alarm_type', '=', google_alarm['method'] if google_alarm['method'] == 'email' else 'notification'),
                     ('duration_minutes', '=', google_alarm['minutes'])
                 ], limit=1
             )
             if not alarm:
                 data = {
-                    'type': google_alarm['method'] if google_alarm['method'] == 'email' else 'notification',
+                    'alarm_type': google_alarm['method'] if google_alarm['method'] == 'email' else 'notification',
                     'duration': google_alarm['minutes'],
                     'interval': 'minutes',
                     'name': "%s minutes - %s" % (google_alarm['minutes'], google_alarm['method'])
@@ -499,7 +524,7 @@ class GoogleCalendar(models.AbstractModel):
         if type == "write":
             res = CalendarEvent.browse(event['id']).write(result)
         elif type == "copy":
-            result['recurrence'] = True
+            result['recurrency'] = True
             res = CalendarEvent.browse([event['id']]).write(result)
         elif type == "create":
             res = CalendarEvent.create(result).id
@@ -531,12 +556,12 @@ class GoogleCalendar(models.AbstractModel):
         for user_to_sync in users.ids:
             _logger.info("Calendar Synchro - Starting synchronization for a new user [%s]", user_to_sync)
             try:
-                resp = self.sudo(user_to_sync).synchronize_events(lastSync=True)
+                resp = self.with_user(user_to_sync).synchronize_events(lastSync=True)
                 if resp.get("status") == "need_reset":
                     _logger.info("[%s] Calendar Synchro - Failed - NEED RESET  !", user_to_sync)
                 else:
                     _logger.info("[%s] Calendar Synchro - Done with status : %s  !", user_to_sync, resp.get("status"))
-            except Exception, e:
+            except Exception as e:
                 _logger.info("[%s] Calendar Synchro - Exception : %s !", user_to_sync, exception_to_unicode(e))
         _logger.info("Calendar Synchro - Ended by cron")
 
@@ -545,7 +570,7 @@ class GoogleCalendar(models.AbstractModel):
         user_to_sync = self.ids and self.ids[0] or self.env.uid
         current_user = self.env['res.users'].sudo().browse(user_to_sync)
 
-        recs = self.sudo(user_to_sync)
+        recs = self.with_user(user_to_sync)
         status, current_google, ask_time = recs.get_calendar_primary_id()
         if current_user.google_calendar_cal_id:
             if current_google != current_user.google_calendar_cal_id:
@@ -596,7 +621,8 @@ class GoogleCalendar(models.AbstractModel):
             ('event_id.final_date', '>', fields.Datetime.to_string(self.get_minTime())),
         ])
         for att in my_attendees:
-            other_google_ids = [other_att.google_internal_event_id for other_att in att.event_id.attendee_ids if other_att.google_internal_event_id and other_att.id != att.id]
+            other_google_ids = [other_att.google_internal_event_id for other_att in att.event_id.attendee_ids if
+                                other_att.google_internal_event_id and other_att.id != att.id and not other_att.google_internal_event_id.startswith('_')]
             for other_google_id in other_google_ids:
                 if self.get_one_event_synchro(other_google_id):
                     att.write({'google_internal_event_id': other_google_id})
@@ -632,10 +658,11 @@ class GoogleCalendar(models.AbstractModel):
             if not source_attendee_record:
                 continue
 
-            if att.event_id.recurrent_id_date and source_event_record.allday and source_attendee_record.google_internal_event_id:
-                new_google_internal_event_id = source_attendee_record.google_internal_event_id + '_' + att.event_id.recurrent_id_date.split(' ')[0].replace('-', '')
-            elif att.event_id.recurrent_id_date and source_attendee_record.google_internal_event_id:
-                new_google_internal_event_id = source_attendee_record.google_internal_event_id + '_' + att.event_id.recurrent_id_date.replace('-', '').replace(' ', 'T').replace(':', '') + 'Z'
+            recurrent_id_date = fields.Datetime.to_string(att.event_id.recurrent_id_date)
+            if recurrent_id_date and source_event_record.allday and source_attendee_record.google_internal_event_id:
+                new_google_internal_event_id = source_attendee_record.google_internal_event_id + '_' + recurrent_id_date.split(' ')[0].replace('-', '')
+            elif recurrent_id_date and source_attendee_record.google_internal_event_id:
+                new_google_internal_event_id = source_attendee_record.google_internal_event_id + '_' + recurrent_id_date.replace('-', '').replace(' ', 'T').replace(':', '') + 'Z'
 
             if new_google_internal_event_id:
                 #TODO WARNING, NEED TO CHECK THAT EVENT and ALL instance NOT DELETE IN GMAIL BEFORE !
@@ -648,8 +675,9 @@ class GoogleCalendar(models.AbstractModel):
                     else:
                         _logger.warning("Impossible to create event %s. [%s]", att.event_id.id, status)
                         _logger.debug("Response : %s", response)
-                except:
-                    pass
+                except Exception as e:
+                    _logger.warning("Exception when updating recurrent event exclusions on google: %s", e)
+
         return new_ids
 
     def update_events(self, lastSync=False):
@@ -662,20 +690,20 @@ class GoogleCalendar(models.AbstractModel):
         if lastSync:
             try:
                 all_event_from_google = self.get_event_synchro_dict(lastSync=lastSync)
-            except urllib2.HTTPError, e:
-                if e.code == 410:  # GONE, Google is lost.
+            except requests.HTTPError as e:
+                if e.response.status_code == 410:  # GONE, Google is lost.
                     # we need to force the rollback from this cursor, because it locks my res_users but I need to write in this tuple before to raise.
                     self.env.cr.rollback()
                     self.env.user.write({'google_calendar_last_sync_date': False})
                     self.env.cr.commit()
-                error_key = json.loads(str(e))
+                error_key = e.response.json()
                 error_key = error_key.get('error', {}).get('message', 'nc')
                 error_msg = _("Google is lost... the next synchro will be a full synchro. \n\n %s") % error_key
                 raise self.env['res.config.settings'].get_config_warning(error_msg)
 
             my_google_attendees = CalendarAttendee.with_context(context_novirtual).search([
                 ('partner_id', '=', my_partner_id),
-                ('google_internal_event_id', 'in', all_event_from_google.keys())
+                ('google_internal_event_id', 'in', list(all_event_from_google))
             ])
             my_google_att_ids = my_google_attendees.ids
 
@@ -755,9 +783,9 @@ class GoogleCalendar(models.AbstractModel):
             ev_to_sync.GG.found = True
             ev_to_sync.GG.isRecurrence = bool(event.get('recurrence', ''))
             ev_to_sync.GG.isInstance = bool(event.get('recurringEventId', 0))
-            ev_to_sync.GG.update = event.get('updated', None)  # if deleted, no date without browse event
+            ev_to_sync.GG.update = event.get('updated') and parser.parse(event['updated']) or None  # if deleted, no date without browse event
             if ev_to_sync.GG.update:
-                ev_to_sync.GG.update = ev_to_sync.GG.update.replace('T', ' ').replace('Z', '')
+                ev_to_sync.GG.update = ev_to_sync.GG.update.replace(tzinfo=None)
             ev_to_sync.GG.status = (event.get('status') != 'cancelled')
 
         ######################
@@ -774,27 +802,23 @@ class GoogleCalendar(models.AbstractModel):
         #      DO ACTION     #
         ######################
         for base_event in event_to_synchronize:
-            event_to_synchronize[base_event] = sorted(event_to_synchronize[base_event].iteritems(), key=operator.itemgetter(0))
+            event_to_synchronize[base_event] = sorted(event_to_synchronize[base_event].items(), key=operator.itemgetter(0))
             for current_event in event_to_synchronize[base_event]:
                 self.env.cr.commit()
                 event = current_event[1]  # event is an Sync Event !
                 actToDo = event.OP
                 actSrc = event.OP.src
 
+                # To avoid redefining 'self', all method below should use 'recs' instead of 'self'
                 recs = self.with_context(curr_attendee=event.OE.attendee_id)
 
                 if isinstance(actToDo, NothingToDo):
                     continue
                 elif isinstance(actToDo, Create):
-                    context_tmp = {'newMeeting': True}
                     if actSrc == 'GG':
-                        res = recs.with_context(context_tmp).update_from_google(False, event.GG.event, "create")
-                        event.OE.event_id = res
-                        meeting = CalendarEvent.browse(res)
-                        attendee_records = CalendarAttendee.search([('partner_id', '=', my_partner_id), ('event_id', '=', res)])
-                        attendee_records.with_context(context_tmp).write({'oe_synchro_date': meeting.oe_update_date, 'google_internal_event_id': event.GG.event['id']})
+                        self.create_from_google(event, my_partner_id)
                     elif actSrc == 'OE':
-                        raise "Should be never here, creation for OE is done before update !"
+                        raise AssertionError("Should be never here, creation for OE is done before update !")
                     #TODO Add to batch
                 elif isinstance(actToDo, Update):
                     if actSrc == 'GG':
@@ -806,10 +830,15 @@ class GoogleCalendar(models.AbstractModel):
                         recs.delete_an_event(current_event[0])
                     elif actSrc == 'GG':
                         new_google_event_id = event.GG.event['id'].rsplit('_', 1)[1]
+                        parent_oe = event_to_synchronize[base_event][0][1].OE.event
                         if 'T' in new_google_event_id:
                             new_google_event_id = new_google_event_id.replace('T', '')[:-1]
                         else:
-                            new_google_event_id = new_google_event_id + "000000"
+                            #allday event, need to match the changes that will be applied with _inverse_dates otherwise the exclusion will not occur
+                            if parent_oe:
+                                new_google_event_id = new_google_event_id + parent_oe.start.strftime("%H%M%S")
+                            else:
+                                new_google_event_id = new_google_event_id + "000000"
 
                         if event.GG.status:
                             parent_event = {}
@@ -817,20 +846,30 @@ class GoogleCalendar(models.AbstractModel):
                                 main_ev = CalendarAttendee.with_context(context_novirtual).search([('google_internal_event_id', '=', event.GG.event['id'].rsplit('_', 1)[0])], limit=1)
                                 event_to_synchronize[base_event][0][1].OE.event_id = main_ev.event_id.id
 
-                            parent_event['id'] = "%s-%s" % (event_to_synchronize[base_event][0][1].OE.event_id, new_google_event_id)
-                            res = recs.update_from_google(parent_event, event.GG.event, "copy")
+                            if event_to_synchronize[base_event][0][1].OE.event_id:
+                                parent_event['id'] = "%s-%s" % (event_to_synchronize[base_event][0][1].OE.event_id, new_google_event_id)
+                                res = recs.update_from_google(parent_event, event.GG.event, "copy")
+                            else:
+                                recs.create_from_google(event, my_partner_id)
                         else:
-                            parent_oe_id = event_to_synchronize[base_event][0][1].OE.event_id
-                            if parent_oe_id:
-                                CalendarEvent.browse("%s-%s" % (parent_oe_id, new_google_event_id)).with_context(curr_attendee=event.OE.attendee_id).unlink(can_be_deleted=True)
+                            if parent_oe:
+                                CalendarEvent.browse("%s-%s" % (parent_oe.id, new_google_event_id)).with_context(curr_attendee=event.OE.attendee_id).unlink(can_be_deleted=True)
+                            else:
+                                main_att = CalendarAttendee.with_context(context_novirtual).search([('partner_id', '=', my_partner_id), ('google_internal_event_id', '=', event.GG.event['id'].rsplit('_', 1)[0])], limit=1)
+                                if main_att:
+                                    excluded_event_id = str(main_att.event_id.id) + '-' + new_google_event_id
+
+                                    CalendarEvent.browse(excluded_event_id).with_context(google_internal_event_id=event.GG.event.get('id'), oe_update_date=False).unlink(can_be_deleted=False)
+                                else:
+                                    _logger.warning("Could not create the correct exclusion for event")
 
                 elif isinstance(actToDo, Delete):
                     if actSrc == 'GG':
                         try:
                             # if already deleted from gmail or never created
                             recs.delete_an_event(current_event[0])
-                        except Exception, e:
-                            if e.code in (401, 410,):
+                        except requests.exceptions.HTTPError as e:
+                            if e.response.status_code in (401, 410,):
                                 pass
                             else:
                                 raise e
@@ -839,9 +878,9 @@ class GoogleCalendar(models.AbstractModel):
         return True
 
     def check_and_sync(self, oe_event, google_event):
-        if datetime.strptime(oe_event.oe_update_date, "%Y-%m-%d %H:%M:%S.%f") > datetime.strptime(google_event['updated'], "%Y-%m-%dT%H:%M:%S.%fz"):
+        if oe_event.oe_update_date > datetime.strptime(google_event['updated'], "%Y-%m-%dT%H:%M:%S.%fz"):
             self.update_to_google(oe_event, google_event)
-        elif datetime.strptime(oe_event.oe_update_date, "%Y-%m-%d %H:%M:%S.%f") < datetime.strptime(google_event['updated'], "%Y-%m-%dT%H:%M:%S.%fz"):
+        elif oe_event.oe_update_date < datetime.strptime(google_event['updated'], "%Y-%m-%dT%H:%M:%S.%fz"):
             self.update_from_google(oe_event, google_event, 'write')
 
     def get_sequence(self, instance_id):
@@ -861,7 +900,7 @@ class GoogleCalendar(models.AbstractModel):
     def get_token(self):
         current_user = self.env.user
         if not current_user.google_calendar_token_validity or \
-                fields.Datetime.from_string(current_user.google_calendar_token_validity.split('.')[0]) < (datetime.now() + timedelta(minutes=1)):
+                current_user.google_calendar_token_validity < (datetime.now() + timedelta(minutes=1)):
             self.do_refresh_token()
             current_user.refresh()
         return current_user.google_calendar_token
@@ -906,14 +945,14 @@ class GoogleCalendar(models.AbstractModel):
         self.env.user.sudo().write(vals)
 
     def get_minTime(self):
-        number_of_week = self.env['ir.config_parameter'].get_param('calendar.week_synchro', default=13)
-        return datetime.now() - timedelta(weeks=number_of_week)
+        number_of_week = self.env['ir.config_parameter'].sudo().get_param('calendar.week_synchro', default=13)
+        return datetime.now() - timedelta(weeks=int(number_of_week))
 
     def get_need_synchro_attendee(self):
-        return self.env['ir.config_parameter'].get_param('calendar.block_synchro_attendee', default=True)
+        return self.env['ir.config_parameter'].sudo().get_param('calendar.block_synchro_attendee', default=True)
 
     def get_disable_since_synchro(self):
-        return self.env['ir.config_parameter'].get_param('calendar.block_since_synchro', default=False)
+        return self.env['ir.config_parameter'].sudo().get_param('calendar.block_since_synchro', default=False)
 
     def get_print_log(self):
-        return self.env['ir.config_parameter'].get_param('calendar.debug_print', default=False)
+        return self.env['ir.config_parameter'].sudo().get_param('calendar.debug_print', default=False)

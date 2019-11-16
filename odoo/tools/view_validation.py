@@ -1,17 +1,143 @@
 """ View validation code (using assertions, not the RNG schema). """
 
+import ast
 import collections
 import logging
+import os
+import re
+
+from lxml import etree
+from odoo import tools
 
 _logger = logging.getLogger(__name__)
 
 
 _validators = collections.defaultdict(list)
-def valid_view(arch):
+_relaxng_cache = {}
+
+READONLY = re.compile(r"\breadonly\b")
+
+
+def _get_attrs_symbols():
+    """ Return a set of predefined symbols for evaluating attrs. """
+    return {
+        'True', 'False', 'None',    # those are identifiers in Python 2.7
+        'self',
+        'id',
+        'uid',
+        'context',
+        'context_today',
+        'active_id',
+        'active_ids',
+        'allowed_company_ids',
+        'current_company_id',
+        'active_model',
+        'time',
+        'datetime',
+        'relativedelta',
+        'current_date',
+        'abs',
+        'len',
+        'bool',
+        'float',
+        'str',
+        'unicode',
+    }
+
+
+def get_variable_names(expr):
+    """ Return the subexpressions of the kind "VARNAME(.ATTNAME)*" in the given
+    string or AST node.
+    """
+    IGNORED = _get_attrs_symbols()
+    names = set()
+
+    def get_name_seq(node):
+        if isinstance(node, ast.Name):
+            return [node.id]
+        elif isinstance(node, ast.Attribute):
+            left = get_name_seq(node.value)
+            return left and left + [node.attr]
+
+    def process(node):
+        seq = get_name_seq(node)
+        if seq and seq[0] not in IGNORED:
+            names.add('.'.join(seq))
+        else:
+            for child in ast.iter_child_nodes(node):
+                process(child)
+
+    if isinstance(expr, str):
+        expr = ast.parse(expr.strip(), mode='eval').body
+    process(expr)
+
+    return names
+
+
+def get_dict_asts(expr):
+    """ Check that the given string or AST node represents a dict expression
+    where all keys are string literals, and return it as a dict mapping string
+    keys to the AST of values.
+    """
+    if isinstance(expr, str):
+        expr = ast.parse(expr.strip(), mode='eval').body
+
+    if not isinstance(expr, ast.Dict):
+        raise ValueError("Non-dict expression")
+    if not all(isinstance(key, ast.Str) for key in expr.keys):
+        raise ValueError("Non-string literal dict key")
+    return {key.s: val for key, val in zip(expr.keys, expr.values)}
+
+
+def get_domain_identifiers(expr):
+    """ Check that the given string or AST node represents a domain expression,
+    and return a pair of sets ``(fields, vars)`` where ``fields`` are the field
+    names on the left-hand side of conditions, and ``vars`` are the variable
+    names on the right-hand side of conditions.
+    """
+    if not expr:  # case of expr=""
+        return (set(), set())
+    if isinstance(expr, str):
+        expr = ast.parse(expr.strip(), mode='eval').body
+
+    def check(condition):
+        if not condition:
+            raise ValueError("Expression is not a valid domain")
+
+    check(isinstance(expr, ast.List))
+    fnames = set()
+    vnames = set()
+    leaves = list(ast.iter_child_nodes(expr))
+    check(isinstance(leaves.pop(), ast.Load))
+    for leaf in leaves:
+        if isinstance(leaf, ast.Str):
+            # note: this doesn't check the and/or structure
+            check(leaf.s in ('&', '|', '!'))
+        else:
+            check(isinstance(leaf, (ast.List, ast.Tuple)))
+            tuple_ = list(ast.iter_child_nodes(leaf))
+            check(isinstance(tuple_.pop(), ast.Load) and len(tuple_) == 3)
+            lhs, operator, rhs = tuple_
+            if isinstance(lhs, ast.Str):
+                fnames.add(lhs.s)
+            else:
+                # limitation: we do not list fnames in this case
+                vnames.update(get_variable_names(lhs))
+            check(isinstance(operator, ast.Str))
+            vnames.update(get_variable_names(rhs))
+
+    return (fnames, vnames)
+
+
+def valid_view(arch, **kwargs):
     for pred in _validators[arch.tag]:
-        if not pred(arch):
+        check = pred(arch, **kwargs)
+        if not check:
             _logger.error("Invalid XML: %s", pred.__doc__)
             return False
+        if check == "Warning":
+            _logger.warning("Invalid XML: %s", pred.__doc__)
+            return "Warning"
     return True
 
 
@@ -25,60 +151,27 @@ def validate(*view_types):
     return decorator
 
 
-@validate('form')
-def valid_page_in_book(arch):
-    """A `page` node must be below a `notebook` node."""
-    return not arch.xpath('//page[not(ancestor::notebook)]')
+def relaxng(view_type):
+    """ Return a validator for the given view type, or None. """
+    if view_type not in _relaxng_cache:
+        with tools.file_open(os.path.join('base', 'rng', '%s_view.rng' % view_type)) as frng:
+            try:
+                relaxng_doc = etree.parse(frng)
+                _relaxng_cache[view_type] = etree.RelaxNG(relaxng_doc)
+            except Exception:
+                _logger.exception('Failed to load RelaxNG XML schema for views validation')
+                _relaxng_cache[view_type] = None
+    return _relaxng_cache[view_type]
 
 
-@validate('graph')
-def valid_field_in_graph(arch):
-    """ Children of ``graph`` can only be ``field`` """
-    return all(
-        child.tag == 'field'
-        for child in arch.xpath('/graph/*')
-    )
-
-
-@validate('tree')
-def valid_field_in_tree(arch):
-    """ Children of ``tree`` view must be ``field`` or ``button``."""
-    return all(
-        child.tag in ('field', 'button')
-        for child in arch.xpath('/tree/*')
-    )
-
-
-@validate('form', 'graph', 'tree')
-def valid_att_in_field(arch):
-    """ ``field`` nodes must all have a ``@name`` """
-    return not arch.xpath('//field[not(@name)]')
-
-
-@validate('form')
-def valid_att_in_label(arch):
-    """ ``label`` nodes must have a ``@for`` or a ``@string`` """
-    return not arch.xpath('//label[not(@for or @string)]')
-
-
-@validate('form')
-def valid_att_in_form(arch):
+@validate('calendar', 'graph', 'pivot', 'search', 'tree', 'activity')
+def schema_valid(arch, **kwargs):
+    """ Get RNG validator and validate RNG file."""
+    validator = relaxng(arch.tag)
+    if validator and not validator.validate(arch):
+        result = True
+        for error in validator.error_log:
+            _logger.error(tools.ustr(error))
+            result = False
+        return result
     return True
-
-
-@validate('form')
-def valid_type_in_colspan(arch):
-    """A `colspan` attribute must be an `integer` type."""
-    return all(
-        attrib.isdigit()
-        for attrib in arch.xpath('//@colspan')
-    )
-
-
-@validate('form')
-def valid_type_in_col(arch):
-    """A `col` attribute must be an `integer` type."""
-    return all(
-        attrib.isdigit()
-        for attrib in arch.xpath('//@col')
-    )

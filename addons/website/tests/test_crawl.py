@@ -2,18 +2,21 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 import logging
-import urlparse
 import time
 
 import lxml.html
+from werkzeug import urls
 
 import odoo
 import re
 
+from odoo.addons.base.tests.common import HttpCaseWithUserDemo
+
 _logger = logging.getLogger(__name__)
 
 
-class Crawler(odoo.tests.HttpCase):
+@odoo.tests.common.tagged('post_install', '-at_install', 'crawl')
+class Crawler(HttpCaseWithUserDemo):
     """ Test suite crawling an Odoo CMS instance and checking that all
     internal links lead to a 200 response.
 
@@ -21,8 +24,22 @@ class Crawler(odoo.tests.HttpCase):
     starting the crawl
     """
 
-    at_install = False
-    post_install = True
+    def setUp(self):
+        super(Crawler, self).setUp()
+
+        if hasattr(self.env['res.partner'], 'grade_id'):
+            # Create at least one published parter, so that /partners doesn't
+            # return a 404
+            grade = self.env['res.partner.grade'].create({
+                'name': 'A test grade',
+                'website_published': True,
+            })
+            self.env['res.partner'].create({
+                'name': 'A Company for /partners',
+                'is_company': True,
+                'grade_id': grade.id,
+                'website_published': True,
+            })
 
     def crawl(self, url, seen=None, msg=''):
         if seen is None:
@@ -37,23 +54,17 @@ class Crawler(odoo.tests.HttpCase):
 
         _logger.info("%s %s", msg, url)
         r = self.url_open(url)
-        code = r.getcode()
-        self.assertIn(code, xrange(200, 300), "%s Fetching %s returned error response (%d)" % (msg, url, code))
+        code = r.status_code
+        self.assertIn(code, range(200, 300), "%s Fetching %s returned error response (%d)" % (msg, url, code))
 
-        if r.info().gettype() == 'text/html':
-            doc = lxml.html.fromstring(r.read())
+        if r.headers['Content-Type'].startswith('text/html'):
+            doc = lxml.html.fromstring(r.content)
             for link in doc.xpath('//a[@href]'):
                 href = link.get('href')
 
-                parts = urlparse.urlsplit(href)
+                parts = urls.url_parse(href)
                 # href with any fragment removed
-                href = urlparse.urlunsplit((
-                    parts.scheme,
-                    parts.netloc,
-                    parts.path,
-                    parts.query,
-                    ''
-                ))
+                href = parts.replace(fragment='').to_url()
 
                 # FIXME: handle relative link (not parts.path.startswith /)
                 if parts.netloc or \

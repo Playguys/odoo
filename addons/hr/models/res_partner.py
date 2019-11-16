@@ -2,6 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from odoo import api, models
+from odoo.exceptions import AccessError
 
 
 class Partner(models.Model):
@@ -13,12 +14,23 @@ class Partner(models.Model):
         """ Extend the mail's static mention suggestions by adding the employees. """
         suggestions = super(Partner, self).get_static_mention_suggestions()
 
-        employee_group_id = self.env['ir.model.data'].xmlid_to_res_id('base.group_user')
-        self._cr.execute("""
-            SELECT P.id, P.name, P.email
-            FROM res_users U
-                INNER JOIN res_groups_users_rel R ON U.id = R.uid
-                INNER JOIN res_partner P ON P.id = U.partner_id
-            WHERE R.gid = %s AND U.active = 't'""", (employee_group_id,))
-        suggestions.append(self._cr.dictfetchall())
-        return suggestions
+        try:
+            employee_group = self.env.ref('base.group_user')
+            hr_suggestions = [{'id': user.partner_id.id, 'name': user.name, 'email': user.email} for user in employee_group.users]
+            suggestions.append(hr_suggestions)
+            return suggestions
+        except AccessError:
+            return suggestions
+
+    def name_get(self):
+        """ Override to allow an employee to see its private address in his profile.
+            This avoids to relax access rules on `res.parter` and to add an `ir.rule`.
+            (advantage in both security and performance).
+            Use a try/except instead of systematically checking to minimize the impact on performance.
+            """
+        try:
+            return super(Partner, self).name_get()
+        except AccessError as e:
+            if len(self) == 1 and self in self.env.user.employee_ids.mapped('address_home_id'):
+                return super(Partner, self.sudo()).name_get()
+            raise e

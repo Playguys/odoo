@@ -8,6 +8,7 @@ import uuid
 
 from odoo import api, fields, models, tools, _
 from odoo.exceptions import UserError, ValidationError
+from odoo.tools.misc import get_lang
 
 _logger = logging.getLogger(__name__)
 
@@ -24,15 +25,14 @@ class BaseGengoTranslations(models.TransientModel):
     GROUPS = ['base.group_system']
 
     _name = 'base.gengo.translations'
+    _description = 'Base Gengo Translations'
 
     @api.model
     def default_get(self, fields):
         res = super(BaseGengoTranslations, self).default_get(fields)
         res['authorized_credentials'], gengo = self.gengo_authentication()
         if 'lang_id' in fields:
-            res['lang_id'] = self.env['res.lang'].search([
-                ('code', '=', self.env.context.get('lang', 'en_US'))
-            ], limit=1).id
+            res['lang_id'] = get_lang(self.env).id
         return res
 
     sync_type = fields.Selection([
@@ -44,27 +44,23 @@ class BaseGengoTranslations(models.TransientModel):
     sync_limit = fields.Integer("No. of terms to sync", default=20)
     authorized_credentials = fields.Boolean('The private and public keys are valid')
 
-    @api.model_cr
     def init(self):
         icp = self.env['ir.config_parameter'].sudo()
-        if not icp.get_param(self.GENGO_KEY, default=None):
-            icp.set_param(self.GENGO_KEY, str(uuid.uuid4()), groups=self.GROUPS)
+        if not icp.get_param(self.GENGO_KEY):
+            icp.set_param(self.GENGO_KEY, str(uuid.uuid4()))
 
-    @api.model_cr
-    def get_gengo_key(self):
+    def _get_gengo_key(self):
         icp = self.env['ir.config_parameter'].sudo()
         return icp.get_param(self.GENGO_KEY, default="Undefined")
 
-    @api.multi
     def open_company(self):
         self.ensure_one()
         return {
             'type': 'ir.actions.act_window',
-            'view_type': 'form',
             'view_mode': 'form',
-            'res_model': 'res.company',
-            'res_id': self.env.user.company_id.id,
-            'target': 'current',
+            'res_model': 'res.config.settings',
+            'target': 'inline',
+            'context': {'module' : 'general_settings'},
             }
 
     @api.model
@@ -90,11 +86,10 @@ class BaseGengoTranslations(models.TransientModel):
             )
             gengo.getAccountStats()
             return (True, gengo)
-        except Exception, e:
+        except Exception as e:
             _logger.exception('Gengo connection failed')
             return (False, _("Gengo connection failed with this message:\n``%s``") % e)
 
-    @api.multi
     def act_update(self):
         '''
         Function called by the wizard.
@@ -206,7 +201,7 @@ class BaseGengoTranslations(models.TransientModel):
                 'term2.id': {...}
                 }
             }'''
-        base_url = self.env['ir.config_parameter'].get_param('web.base.url')
+        base_url = self.env['ir.config_parameter'].sudo().get_param('web.base.url')
         IrTranslation = self.env['ir.translation']
         jobs = {}
         user = self.env.user
@@ -226,7 +221,7 @@ class BaseGengoTranslations(models.TransientModel):
                     'lc_tgt': IrTranslation._get_gengo_corresponding_language(term.lang),
                     'auto_approve': auto_approve,
                     'comment': comment,
-                    'callback_url': "%s/website/gengo_callback?pgk=%s&db=%s" % (base_url, self.get_gengo_key(), self.env.cr.dbname)
+                    'callback_url': "%s/website/gengo_callback?pgk=%s&db=%s" % (base_url, self._get_gengo_key(), self.env.cr.dbname)
                 }
         return {'jobs': jobs, 'as_group': 0}
 
@@ -277,5 +272,5 @@ class BaseGengoTranslations(models.TransientModel):
                     _logger.info("%s Translation terms have been posted to Gengo successfully", len(term_ids))
                 if not len(term_ids) == limit:
                     break
-        except Exception, e:
+        except Exception as e:
             _logger.error("%s", e)
